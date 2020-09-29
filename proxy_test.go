@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 )
 
 func TestProxies_ServeHTTP(t *testing.T) {
@@ -36,20 +37,13 @@ func TestProxies_ServeHTTP(t *testing.T) {
 		}))
 		defer proxy2.Close()
 
-		l, err := net.Listen("tcp", ":0")
-		assert.NoError(t, err)
-		go func() {
-			for {
-				conn, err := l.Accept()
-				if err != nil {
-					return
-				}
-				assert.NoError(t, conn.Close())
-			}
-		}()
-
 		t.Run("empty", func(t *testing.T) {
-			h := Proxies{}
+			var c MockCallback
+			defer c.AssertExpectations(t)
+
+			h := Proxy{
+				Callback: c.Callback,
+			}
 
 			w := newRecorder()
 			r := httptest.NewRequest(http.MethodConnect, originURL.Host, nil)
@@ -58,7 +52,14 @@ func TestProxies_ServeHTTP(t *testing.T) {
 		})
 
 		t.Run("OK", func(t *testing.T) {
-			h := Proxies{proxy1.URL, proxy2.URL}
+			var c MockCallback
+			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy1.URL, nil).Return()
+			defer c.AssertExpectations(t)
+
+			h := Proxy{
+				Backends: []string{proxy1.URL, proxy2.URL},
+				Callback: c.Callback,
+			}
 
 			w := newRecorder()
 			r := httptest.NewRequest(http.MethodConnect, originURL.Host, nil)
@@ -68,8 +69,23 @@ func TestProxies_ServeHTTP(t *testing.T) {
 			assert.Equal(t, http.StatusOK, resp.StatusCode)
 		})
 
-		t.Run("invali URL", func(t *testing.T) {
-			h := Proxies{":non-url", proxy2.URL}
+		t.Run("invalid URL", func(t *testing.T) {
+			var c MockCallback
+			c.On("Callback", mock.AnythingOfType("*http.Request"), ":non-url", mock.MatchedBy(func(err error) bool {
+				e, ok := err.(*url.Error)
+				if !ok {
+					return false
+				}
+
+				return e.Op == "parse"
+			})).Return()
+			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy2.URL, nil).Return()
+			defer c.AssertExpectations(t)
+
+			h := Proxy{
+				Backends: []string{":non-url", proxy2.URL},
+				Callback: c.Callback,
+			}
 
 			w := newRecorder()
 			r := httptest.NewRequest(http.MethodConnect, originURL.Host, nil)
@@ -79,7 +95,22 @@ func TestProxies_ServeHTTP(t *testing.T) {
 		})
 
 		t.Run("inaccessible proxy", func(t *testing.T) {
-			h := Proxies{"http://localhost:0/", proxy2.URL}
+			var c MockCallback
+			c.On("Callback", mock.AnythingOfType("*http.Request"), "http://localhost:0/", mock.MatchedBy(func(err error) bool {
+				e, ok := err.(*net.OpError)
+				if !ok {
+					return false
+				}
+
+				return e.Op == "dial"
+			})).Return()
+			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy2.URL, nil).Return()
+			defer c.AssertExpectations(t)
+
+			h := Proxy{
+				Backends: []string{"http://localhost:0/", proxy2.URL},
+				Callback: c.Callback,
+			}
 
 			w := newRecorder()
 			r := httptest.NewRequest(http.MethodConnect, originURL.Host, nil)
@@ -89,7 +120,38 @@ func TestProxies_ServeHTTP(t *testing.T) {
 		})
 
 		t.Run("non-responsive proxy", func(t *testing.T) {
-			h := Proxies{fmt.Sprintf("http://%s/", l.Addr()), proxy2.URL}
+			l, err := net.Listen("tcp", ":0")
+			assert.NoError(t, err)
+			defer func() {
+				assert.NoError(t, l.Close())
+			}()
+
+			go func() {
+				for {
+					conn, err := l.Accept()
+					if err != nil {
+						return
+					}
+					assert.NoError(t, conn.Close())
+				}
+			}()
+
+			var c MockCallback
+			c.On("Callback", mock.AnythingOfType("*http.Request"), fmt.Sprintf("http://%s/", l.Addr()), mock.MatchedBy(func(err error) bool {
+				switch err := err.(type) {
+				case *net.OpError:
+					return err.Op == "read"
+				default:
+					return err == io.ErrUnexpectedEOF
+				}
+			})).Return()
+			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy2.URL, nil).Return()
+			defer c.AssertExpectations(t)
+
+			h := Proxy{
+				Backends: []string{fmt.Sprintf("http://%s/", l.Addr()), proxy2.URL},
+				Callback: c.Callback,
+			}
 
 			w := newRecorder()
 			r := httptest.NewRequest(http.MethodConnect, originURL.Host, nil)
@@ -103,7 +165,23 @@ func TestProxies_ServeHTTP(t *testing.T) {
 			defer func() {
 				proxy1Status = http.StatusOK
 			}()
-			h := Proxies{proxy1.URL, proxy2.URL}
+
+			var c MockCallback
+			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy1.URL, mock.MatchedBy(func(err error) bool {
+				e, ok := err.(*UnsuccessfulStatusError)
+				if !ok {
+					return false
+				}
+
+				return e.StatusCode == http.StatusServiceUnavailable
+			})).Return()
+			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy2.URL, nil).Return()
+			defer c.AssertExpectations(t)
+
+			h := Proxy{
+				Backends: []string{proxy1.URL, proxy2.URL},
+				Callback: c.Callback,
+			}
 
 			w := newRecorder()
 			r := httptest.NewRequest(http.MethodConnect, originURL.Host, nil)
@@ -114,7 +192,12 @@ func TestProxies_ServeHTTP(t *testing.T) {
 	})
 
 	t.Run("Other methods", func(t *testing.T) {
-		h := Proxies{}
+		var c MockCallback
+		defer c.AssertExpectations(t)
+
+		h := Proxy{
+			Callback: c.Callback,
+		}
 
 		w := newRecorder()
 		r := httptest.NewRequest(http.MethodPost, "/", nil)
@@ -170,4 +253,12 @@ func (c *conn) SetReadDeadline(t time.Time) error {
 
 func (c *conn) SetWriteDeadline(t time.Time) error {
 	panic("implement me")
+}
+
+type MockCallback struct {
+	mock.Mock
+}
+
+func (m *MockCallback) Callback(r *http.Request, b string, err error) {
+	m.Called(r, b, err)
 }
