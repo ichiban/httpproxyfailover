@@ -2,12 +2,15 @@ package httpproxyfailover
 
 import (
 	"bufio"
+	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 )
@@ -45,76 +48,119 @@ func (p Proxy) connect(w http.ResponseWriter, r *http.Request) {
 	_ = r.Body.Close()
 
 	for _, b := range p.Backends {
-		u, err := url.Parse(b)
-		if err != nil {
-			p.Callback(r, b, err)
-			continue
-		}
-
-		inbound, err := net.DialTimeout("tcp", u.Host, p.Timeout)
-		if err != nil {
-			p.Callback(r, b, err)
-			continue
-		}
-
-		if err := r.Write(inbound); err != nil {
-			p.Callback(r, b, err)
-			continue
-		}
-
-		br := bufio.NewReader(inbound)
-		resp, err := http.ReadResponse(br, r)
-		if err != nil {
-			p.Callback(r, b, err)
-			continue
-		}
-
-		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-			p.Callback(r, b, &UnsuccessfulStatusError{
-				StatusCode: resp.StatusCode,
-				Status:     resp.Status,
-			})
-			continue
-		}
-
-		p.Callback(r, b, nil)
-
-		h := w.(http.Hijacker)
-		outbound, _, err := h.Hijack()
-		if err != nil {
-			http.Error(w, "", http.StatusBadGateway)
+		if p.connectOne(b, w, r) {
 			return
 		}
-
-		_ = resp.Write(outbound)
-		b, _ := br.Peek(br.Buffered())
-		_, _ = outbound.Write(b)
-
-		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer func() {
-				_ = inbound.Close()
-			}()
-
-			_, _ = io.Copy(inbound, outbound)
-		}()
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer func() {
-				_ = outbound.Close()
-			}()
-
-			_, _ = io.Copy(outbound, inbound)
-		}()
-		wg.Wait()
-
-		return
 	}
 
 	http.Error(w, "", http.StatusServiceUnavailable)
+}
+
+func urlParse(raw string) (*url.URL, error) {
+	if !strings.HasPrefix(raw, "http://") {
+		raw = "http://" + raw
+	}
+	return url.Parse(raw)
+}
+
+func (p *Proxy) connectOne(b string, w http.ResponseWriter, r *http.Request) bool {
+	ctx := r.Context()
+	if p.Timeout != 0 {
+		var cancel func()
+		ctx, cancel = context.WithTimeout(r.Context(), p.Timeout)
+		defer cancel()
+	}
+
+	u, err := urlParse(b)
+	if err != nil {
+		p.Callback(r, b, err)
+		return false
+	}
+
+	var d net.Dialer
+	inbound, err := d.DialContext(ctx, "tcp", u.Host)
+	if err != nil {
+		p.Callback(r, b, err)
+		return false
+	}
+
+	req := backendReq(r, u.User)
+	if err := req.Write(inbound); err != nil {
+		p.Callback(r, b, err)
+		return false
+	}
+
+	br := bufio.NewReader(inbound)
+	resp, err := http.ReadResponse(br, r)
+	if err != nil {
+		p.Callback(r, b, err)
+		return false
+	}
+	_ = resp.Body.Close()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		p.Callback(r, b, &UnsuccessfulStatusError{
+			StatusCode: resp.StatusCode,
+			Status:     resp.Status,
+		})
+		return false
+	}
+
+	p.Callback(r, b, nil)
+
+	h, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "", http.StatusBadGateway)
+		return true
+	}
+
+	outbound, _, err := h.Hijack()
+	if err != nil {
+		http.Error(w, "", http.StatusBadGateway)
+		return true
+	}
+
+	_ = resp.Write(outbound)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer func() {
+			_ = inbound.Close()
+		}()
+
+		_, _ = io.Copy(inbound, outbound)
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer func() {
+			_ = outbound.Close()
+		}()
+
+		_, _ = io.Copy(outbound, inbound)
+	}()
+	wg.Wait()
+
+	return true
+}
+
+func backendReq(r *http.Request, userinfo *url.Userinfo) *http.Request {
+	req := http.Request{
+		Method: http.MethodConnect,
+		URL: &url.URL{
+			Host: r.Host,
+		},
+		Header: http.Header{},
+	}
+	for k, v := range r.Header {
+		req.Header[k] = v
+	}
+	if userinfo != nil {
+		req.Header.Set("Proxy-Authorization", fmt.Sprintf("Basic %s", base64.StdEncoding.EncodeToString([]byte(userinfo.String()))))
+	}
+	return &req
 }
 
 type UnsuccessfulStatusError struct {

@@ -2,12 +2,14 @@ package httpproxyfailover
 
 import (
 	"bufio"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,15 +29,37 @@ func TestProxies_ServeHTTP(t *testing.T) {
 
 		proxy1Status := http.StatusOK
 		proxy1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if credentials(r) != "proxy1:proxy1" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Connection", "close")
 			w.WriteHeader(proxy1Status)
 		}))
 		defer proxy1.Close()
+		proxy1URL := func(username, password string) string {
+			u, err := url.Parse(proxy1.URL)
+			assert.NoError(t, err)
+			u.User = url.UserPassword(username, password)
+			return u.String()
+		}
 
 		proxy2Status := http.StatusOK
 		proxy2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if credentials(r) != "proxy2:proxy2" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Connection", "close")
 			w.WriteHeader(proxy2Status)
 		}))
 		defer proxy2.Close()
+		proxy2URL := func(username, password string) string {
+			u, err := url.Parse(proxy2.URL)
+			assert.NoError(t, err)
+			u.User = url.UserPassword(username, password)
+			return u.String()
+		}
 
 		t.Run("empty", func(t *testing.T) {
 			var c MockCallback
@@ -53,11 +77,37 @@ func TestProxies_ServeHTTP(t *testing.T) {
 
 		t.Run("OK", func(t *testing.T) {
 			var c MockCallback
-			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy1.URL, nil).Return()
+			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy1URL("proxy1", "proxy1"), nil).Return()
 			defer c.AssertExpectations(t)
 
 			h := Proxy{
-				Backends: []string{proxy1.URL, proxy2.URL},
+				Backends: []string{proxy1URL("proxy1", "proxy1"), proxy2URL("proxy2", "proxy2")},
+				Callback: c.Callback,
+			}
+
+			w := newRecorder()
+			r := httptest.NewRequest(http.MethodConnect, originURL.Host, nil)
+			h.ServeHTTP(w, r)
+			assert.Equal(t, http.StatusOK, w.Code)
+			resp := w.Result()
+			assert.Equal(t, http.StatusOK, resp.StatusCode)
+		})
+
+		t.Run("auth error", func(t *testing.T) {
+			var c MockCallback
+			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy1URL("invalid", "invalid"), mock.MatchedBy(func(err error) bool {
+				e, ok := err.(*UnsuccessfulStatusError)
+				if !ok {
+					return false
+				}
+
+				return e.StatusCode == http.StatusUnauthorized
+			})).Return()
+			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy2URL("proxy2", "proxy2"), nil).Return()
+			defer c.AssertExpectations(t)
+
+			h := Proxy{
+				Backends: []string{proxy1URL("invalid", "invalid"), proxy2URL("proxy2", "proxy2")},
 				Callback: c.Callback,
 			}
 
@@ -79,11 +129,11 @@ func TestProxies_ServeHTTP(t *testing.T) {
 
 				return e.Op == "parse"
 			})).Return()
-			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy2.URL, nil).Return()
+			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy2URL("proxy2", "proxy2"), nil).Return()
 			defer c.AssertExpectations(t)
 
 			h := Proxy{
-				Backends: []string{":non-url", proxy2.URL},
+				Backends: []string{":non-url", proxy2URL("proxy2", "proxy2")},
 				Callback: c.Callback,
 			}
 
@@ -104,11 +154,11 @@ func TestProxies_ServeHTTP(t *testing.T) {
 
 				return e.Op == "dial"
 			})).Return()
-			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy2.URL, nil).Return()
+			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy2URL("proxy2", "proxy2"), nil).Return()
 			defer c.AssertExpectations(t)
 
 			h := Proxy{
-				Backends: []string{"http://localhost:0/", proxy2.URL},
+				Backends: []string{"http://localhost:0/", proxy2URL("proxy2", "proxy2")},
 				Callback: c.Callback,
 			}
 
@@ -145,11 +195,11 @@ func TestProxies_ServeHTTP(t *testing.T) {
 					return err == io.ErrUnexpectedEOF
 				}
 			})).Return()
-			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy2.URL, nil).Return()
+			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy2URL("proxy2", "proxy2"), nil).Return()
 			defer c.AssertExpectations(t)
 
 			h := Proxy{
-				Backends: []string{fmt.Sprintf("http://%s/", l.Addr()), proxy2.URL},
+				Backends: []string{fmt.Sprintf("http://%s/", l.Addr()), proxy2URL("proxy2", "proxy2")},
 				Callback: c.Callback,
 			}
 
@@ -167,7 +217,7 @@ func TestProxies_ServeHTTP(t *testing.T) {
 			}()
 
 			var c MockCallback
-			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy1.URL, mock.MatchedBy(func(err error) bool {
+			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy1URL("proxy1", "proxy1"), mock.MatchedBy(func(err error) bool {
 				e, ok := err.(*UnsuccessfulStatusError)
 				if !ok {
 					return false
@@ -175,11 +225,11 @@ func TestProxies_ServeHTTP(t *testing.T) {
 
 				return e.StatusCode == http.StatusServiceUnavailable
 			})).Return()
-			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy2.URL, nil).Return()
+			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy2URL("proxy2", "proxy2"), nil).Return()
 			defer c.AssertExpectations(t)
 
 			h := Proxy{
-				Backends: []string{proxy1.URL, proxy2.URL},
+				Backends: []string{proxy1URL("proxy1", "proxy1"), proxy2URL("proxy2", "proxy2")},
 				Callback: c.Callback,
 			}
 
@@ -261,4 +311,20 @@ type MockCallback struct {
 
 func (m *MockCallback) Callback(r *http.Request, b string, err error) {
 	m.Called(r, b, err)
+}
+
+func credentials(r *http.Request) string {
+	auth := r.Header.Get("Proxy-Authorization")
+	fields := strings.Fields(auth)
+	if len(fields) != 2 {
+		return ""
+	}
+	if fields[0] != "Basic" {
+		return ""
+	}
+	b, err := base64.StdEncoding.DecodeString(fields[1])
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
