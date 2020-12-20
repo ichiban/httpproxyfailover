@@ -2,6 +2,7 @@ package httpproxyfailover
 
 import (
 	"bufio"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -96,12 +97,12 @@ func TestProxies_ServeHTTP(t *testing.T) {
 		t.Run("auth error", func(t *testing.T) {
 			var c MockCallback
 			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy1URL("invalid", "invalid"), mock.MatchedBy(func(err error) bool {
-				e, ok := err.(*UnsuccessfulStatusError)
+				e, ok := err.(*unsuccessfulStatusError)
 				if !ok {
 					return false
 				}
 
-				return e.StatusCode == http.StatusUnauthorized
+				return e.statusCode == http.StatusUnauthorized
 			})).Return()
 			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy2URL("proxy2", "proxy2"), nil).Return()
 			defer c.AssertExpectations(t)
@@ -218,12 +219,12 @@ func TestProxies_ServeHTTP(t *testing.T) {
 
 			var c MockCallback
 			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy1URL("proxy1", "proxy1"), mock.MatchedBy(func(err error) bool {
-				e, ok := err.(*UnsuccessfulStatusError)
+				e, ok := err.(*unsuccessfulStatusError)
 				if !ok {
 					return false
 				}
 
-				return e.StatusCode == http.StatusServiceUnavailable
+				return e.statusCode == http.StatusServiceUnavailable
 			})).Return()
 			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy2URL("proxy2", "proxy2"), nil).Return()
 			defer c.AssertExpectations(t)
@@ -253,6 +254,74 @@ func TestProxies_ServeHTTP(t *testing.T) {
 		r := httptest.NewRequest(http.MethodPost, "/", nil)
 		h.ServeHTTP(w, r)
 		assert.Equal(t, http.StatusMethodNotAllowed, w.Code)
+	})
+
+	t.Run("TLS handshake", func(t *testing.T) {
+		origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.NoError(t, r.Body.Close())
+			_, err := w.Write([]byte("origin"))
+			assert.NoError(t, err)
+		}))
+		defer origin.Close()
+
+		backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, http.MethodConnect, r.Method)
+			assert.NoError(t, r.Body.Close())
+
+			inbound, err := net.Dial("tcp", r.URL.Host)
+			assert.NoError(t, err)
+
+			w.Header().Set("Content-Length", "0")
+			w.WriteHeader(http.StatusOK)
+			h, ok := w.(http.Hijacker)
+			assert.True(t, ok)
+
+			outbound, _, err := h.Hijack()
+			assert.NoError(t, err)
+
+			pipe(inbound, outbound)
+		}))
+		defer backend.Close()
+
+		t.Run("OK", func(t *testing.T) {
+			proxy := httptest.NewServer(&Proxy{
+				Backends:     []string{backend.URL},
+				TLSHandshake: origin.Client().Transport.(*http.Transport).TLSClientConfig,
+			})
+			defer proxy.Close()
+
+			proxyURL, err := url.Parse(proxy.URL)
+			assert.NoError(t, err)
+
+			c := origin.Client()
+			transport, ok := c.Transport.(*http.Transport)
+			assert.True(t, ok)
+			transport.Proxy = http.ProxyURL(proxyURL)
+
+			resp, err := c.Get(origin.URL)
+			assert.NoError(t, err)
+			assert.NoError(t, resp.Body.Close())
+			assert.Equal(t, http.StatusOK, resp.StatusCode)
+		})
+
+		t.Run("NG", func(t *testing.T) {
+			proxy := httptest.NewServer(&Proxy{
+				Backends:     []string{backend.URL},
+				TLSHandshake: &tls.Config{},
+			})
+			defer proxy.Close()
+
+			proxyURL, err := url.Parse(proxy.URL)
+			assert.NoError(t, err)
+
+			c := origin.Client()
+			transport, ok := c.Transport.(*http.Transport)
+			assert.True(t, ok)
+			transport.Proxy = http.ProxyURL(proxyURL)
+
+			_, err = c.Get(origin.URL)
+			assert.Error(t, err)
+		})
 	})
 }
 

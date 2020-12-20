@@ -34,8 +34,8 @@ func main() {
 
 			log.Printf("CONNECT %s", r.URL.Host)
 
-			_, _ = ioutil.ReadAll(r.Body)
-			r.Body.Close()
+			_, _ = io.Copy(ioutil.Discard, r.Body)
+			_ = r.Body.Close()
 
 			if fail {
 				http.Error(w, "", http.StatusBadGateway)
@@ -70,6 +70,7 @@ func main() {
 
 				_, _ = io.Copy(outbound, inbound)
 			}()
+			wg.Wait()
 		}),
 	}
 

@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -11,17 +11,18 @@ import (
 	"time"
 
 	"github.com/ichiban/httpproxyfailover"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 )
 
 func main() {
 	var port int
-	var timeout int
-	var verbose bool
+	var timeout time.Duration
+	var tlsHandshake bool
 
 	pflag.IntVarP(&port, "port", "p", 0, "specify port number")
-	pflag.IntVarP(&timeout, "timeout", "t", 0, "set timeout (millisecond)")
-	pflag.BoolVarP(&verbose, "verbose", "v", false, "show logs")
+	pflag.DurationVarP(&timeout, "timeout", "t", 0, "set timeout")
+	pflag.BoolVarP(&tlsHandshake, "tls", "T", false, "check TLS handshake")
 	pflag.Parse()
 
 	c := make(chan os.Signal, 1)
@@ -29,17 +30,22 @@ func main() {
 
 	p := httpproxyfailover.Proxy{
 		Backends: pflag.Args(),
-		Timeout:  time.Duration(timeout) * time.Millisecond,
+		Timeout:  timeout,
+		Callback: func(r *http.Request, b string, err error) {
+			log := logrus.WithFields(logrus.Fields{
+				"from": r.RemoteAddr,
+				"to":   r.RequestURI,
+				"via":  b,
+			})
+			if err != nil {
+				log.WithError(err).Error("NG")
+			}
+			log.Info("OK")
+		},
 	}
 
-	if verbose {
-		p.Callback = func(r *http.Request, b string, err error) {
-			msg := "success"
-			if err != nil {
-				msg = err.Error()
-			}
-			log.Printf("from:%s\tto:%s\tvia:%s\tresult:%s", r.RemoteAddr, r.RequestURI, b, msg)
-		}
+	if tlsHandshake {
+		p.TLSHandshake = &tls.Config{}
 	}
 
 	s := http.Server{
