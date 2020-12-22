@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -26,8 +27,8 @@ type Proxy struct {
 	// Timeout sets the deadline of trial of each backend HTTP proxy if provided.
 	Timeout time.Duration
 
-	// TLSHandshake requires further check on each backend. If set, a backend is considered available if not only it
-	// responds a CONNECT request with a successful status code (2XX) but also a TLS handshake succeeds.
+	// TLSHandshake requires further check on each backend. If set, a backend which speaks TLS is considered available
+	// if not only it responds a CONNECT request with a successful status code (2XX) but also a TLS handshake succeeds.
 	// This check occurs in a different TCP connection. So there's no guarantee that the proxy connection also succeeds
 	// with a TLS handshake.
 	TLSHandshake *tls.Config
@@ -54,7 +55,7 @@ func (p Proxy) connect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, b := range p.Backends {
-		inbound, resp, err := p.connectOne(b, w, r)
+		inbound, resp, err := p.connectOne(b, r)
 		if err != nil {
 			p.Callback(r, b, err)
 			continue
@@ -89,7 +90,7 @@ func urlParse(raw string) (*url.URL, error) {
 	return url.Parse(raw)
 }
 
-func (p *Proxy) connectOne(b string, w http.ResponseWriter, r *http.Request) (net.Conn, *http.Response, error) {
+func (p *Proxy) connectOne(b string, r *http.Request) (net.Conn, *http.Response, error) {
 	ctx := r.Context()
 	if p.Timeout != 0 {
 		var cancel func()
@@ -148,7 +149,15 @@ func (p *Proxy) checkTLSHandshake(ctx context.Context, r *http.Request, b string
 		_ = conn.Close()
 	}()
 
-	return conn.Handshake()
+	if err := conn.Handshake(); err != nil {
+		// It might not be a TLS server. In that case, it's okay to fail.
+		if errors.As(err, &tls.RecordHeaderError{}) {
+			return nil
+		}
+		return err
+	}
+
+	return nil
 }
 
 func (p *Proxy) inbound(ctx context.Context, r *http.Request, b string) (net.Conn, *http.Response, error) {
