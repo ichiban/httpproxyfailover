@@ -39,6 +39,7 @@ func main() {
 			})
 			if err != nil {
 				log.WithError(err).Error("NG")
+				return
 			}
 			log.Info("OK")
 		},
