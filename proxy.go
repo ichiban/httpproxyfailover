@@ -16,13 +16,16 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/yosida95/uritemplate/v3"
 )
 
 // Proxy is a proxy for backend HTTP proxies.
 type Proxy struct {
 	// Backends hold backend HTTP proxies. Proxy tries backend HTTP proxies in order of the slice and use the first one
 	// that responds with a successful status code (2XX).
-	Backends []string
+	Backends       []string
+	parsedBackends []*uritemplate.Template
 
 	// Timeout sets the deadline of trial of each backend HTTP proxy if provided.
 	Timeout time.Duration
@@ -49,12 +52,38 @@ func (p Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// EnableTemplates() parses backends as URI templates.
+// Proxy will connect to only applicable backends which template variables are satisfied.
+// The values for template variables are populated from the credentials in Proxy-Authorization header. The substring
+// before the first ':' (usually considered as username) should be the form of a list of key-value pairs (`k1=v1,k2=v2`).
+// Each pair is separated by '=' without whitespaces, and those pairs are separated by ',' without whitespaces.
+// Optionally, you can omit '=' and the value (`k1=v1,k2=v2,tag`). Then it's considered a pair of the key and empty
+// string (`k1=v1,k2=v2,tag=`).
+func (p *Proxy) EnableTemplates() error {
+	p.parsedBackends = make([]*uritemplate.Template, len(p.Backends))
+	for i, b := range p.Backends {
+		t, err := uritemplate.New(b)
+		if err != nil {
+			p.parsedBackends = nil
+			return fmt.Errorf("%s: %w", b, err)
+		}
+		p.parsedBackends[i] = t
+	}
+	return nil
+}
+
 func (p Proxy) connect(w http.ResponseWriter, r *http.Request) {
 	if p.Callback == nil {
 		p.Callback = func(*http.Request, string, error) {}
 	}
 
-	for _, b := range p.Backends {
+	backends, err := p.applicableBackends(r)
+	if err != nil {
+		http.Error(w, "", http.StatusBadRequest)
+		return
+	}
+
+	for _, b := range backends {
 		inbound, resp, err := p.connectOne(b, r)
 		if err != nil {
 			p.Callback(r, b, err)
@@ -81,6 +110,71 @@ func (p Proxy) connect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.Error(w, "", http.StatusServiceUnavailable)
+}
+
+func (p *Proxy) applicableBackends(r *http.Request) ([]string, error) {
+	if p.parsedBackends == nil {
+		return p.Backends, nil
+	}
+
+	values, err := params(r)
+	if err != nil {
+		return nil, err
+	}
+
+	ret := make([]string, 0, len(p.parsedBackends))
+	for _, t := range p.parsedBackends {
+		if !applicable(t, values) {
+			continue
+		}
+		b, err := t.Expand(values)
+		if err != nil {
+			continue
+		}
+		ret = append(ret, b)
+	}
+	return ret, nil
+}
+
+func applicable(t *uritemplate.Template, values uritemplate.Values) bool {
+	for _, n := range t.Varnames() {
+		if _, ok := values[n]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func params(r *http.Request) (uritemplate.Values, error) {
+	const prefix = "Basic "
+
+	auth := r.Header.Get("Proxy-Authorization")
+	if len(auth) < len(prefix) || !strings.EqualFold(auth[:len(prefix)], prefix) {
+		return nil, nil
+	}
+
+	b, err := base64.StdEncoding.DecodeString(auth[len(prefix):])
+	if err != nil {
+		return nil, err
+	}
+
+	ps := string(b)
+	if i := strings.IndexRune(ps, ':'); i >= 0 {
+		ps = ps[:i]
+	}
+
+	values := uritemplate.Values{}
+	for _, kv := range strings.Split(ps, ",") {
+		kv := strings.SplitN(kv, "=", 2)
+		if len(kv) == 1 {
+			kv = append(kv, "")
+		}
+		values.Set(kv[0], uritemplate.Value{
+			T: uritemplate.ValueTypeString,
+			V: kv[1:],
+		})
+	}
+	return values, nil
 }
 
 func urlParse(raw string) (*url.URL, error) {
