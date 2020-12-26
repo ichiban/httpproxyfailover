@@ -25,6 +25,12 @@ func main() {
 	pflag.BoolVarP(&tlsHandshake, "tls", "T", false, "check TLS handshake")
 	pflag.Parse()
 
+	logrus.WithFields(logrus.Fields{
+		"port":         port,
+		"timeout":      timeout,
+		"tlsHandshake": tlsHandshake,
+	}).Info("start")
+
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, syscall.SIGINT)
 
@@ -38,15 +44,19 @@ func main() {
 				"via":  b,
 			})
 			if err != nil {
-				log.WithError(err).Error("NG")
+				log.WithError(err).Warn("fail-over")
 				return
 			}
-			log.Info("OK")
+			log.Info("connect")
 		},
 	}
 
 	if tlsHandshake {
 		p.TLSHandshake = &tls.Config{}
+	}
+
+	if err := p.EnableTemplates(); err != nil {
+		logrus.WithError(err).Fatal("failed to enable templates")
 	}
 
 	s := http.Server{
@@ -59,13 +69,15 @@ func main() {
 		switch err {
 		case nil, http.ErrServerClosed:
 		default:
-			panic(err)
+			logrus.WithError(err).Fatal("failed to listen and serve")
 		}
 	}()
 
 	<-c
 
 	if err := s.Shutdown(context.Background()); err != nil {
-		panic(err)
+		logrus.WithError(err).Fatal("failed to shutdown")
 	}
+
+	logrus.Info("end")
 }

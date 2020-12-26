@@ -94,6 +94,26 @@ func TestProxies_ServeHTTP(t *testing.T) {
 			assert.Equal(t, http.StatusOK, resp.StatusCode)
 		})
 
+		t.Run("OK with templates enabled", func(t *testing.T) {
+			var c MockCallback
+			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy2URL("proxy2", "proxy2"), nil).Return()
+			defer c.AssertExpectations(t)
+
+			h := Proxy{
+				Backends: []string{"{foo}" + strings.Replace(proxy1URL("proxy1", "proxy1"), "proxy", "{proxy}", -1), "{bar}" + strings.Replace(proxy2URL("proxy2", "proxy2"), "proxy", "{proxy}", -1)},
+				Callback: c.Callback,
+			}
+			assert.NoError(t, h.EnableTemplates())
+
+			w := newRecorder()
+			r := httptest.NewRequest(http.MethodConnect, originURL.Host, nil)
+			r.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("bar,proxy=proxy")))
+			h.ServeHTTP(w, r)
+			assert.Equal(t, http.StatusOK, w.Code)
+			resp := w.Result()
+			assert.Equal(t, http.StatusOK, resp.StatusCode)
+		})
+
 		t.Run("auth error", func(t *testing.T) {
 			var c MockCallback
 			c.On("Callback", mock.AnythingOfType("*http.Request"), proxy1URL("invalid", "invalid"), mock.MatchedBy(func(err error) bool {
@@ -322,6 +342,30 @@ func TestProxies_ServeHTTP(t *testing.T) {
 			_, err = c.Get(origin.URL)
 			assert.Error(t, err)
 		})
+	})
+}
+
+func TestProxy_EnableTemplates(t *testing.T) {
+	t.Run("valid URI templates", func(t *testing.T) {
+		h := Proxy{
+			Backends: []string{
+				"{fast}http://{username}:{password}@proxy1.example.com:8080",
+				"http://{username}:{password}@proxy2.example.com:8080",
+				"http://{username}:{password}@proxy3.example.com:8080",
+			},
+		}
+		assert.NoError(t, h.EnableTemplates())
+	})
+
+	t.Run("invalid URI templates", func(t *testing.T) {
+		h := Proxy{
+			Backends: []string{
+				"{fast}http://{username}:{password}@proxy1.example.com:8080",
+				"http://{username:{password}@proxy2.example.com:8080", // invalid
+				"http://{username}:{password}@proxy3.example.com:8080",
+			},
+		}
+		assert.Error(t, h.EnableTemplates())
 	})
 }
 
