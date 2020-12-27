@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,21 +16,22 @@ import (
 	"github.com/spf13/pflag"
 )
 
+func init() {
+	pflag.Usage = func() {
+		_, _ = fmt.Fprintf(os.Stderr, "Usage: %s [options...] <backend proxy URI template>...\n", os.Args[0])
+		pflag.PrintDefaults()
+	}
+}
+
 func main() {
 	var port int
 	var timeout time.Duration
 	var tlsHandshake bool
 
-	pflag.IntVarP(&port, "port", "p", 0, "specify port number")
-	pflag.DurationVarP(&timeout, "timeout", "t", 0, "set timeout")
-	pflag.BoolVarP(&tlsHandshake, "tls", "T", false, "check TLS handshake")
+	pflag.IntVarP(&port, "port", "p", 0, "Specify port number to listen on (random if not specified)")
+	pflag.DurationVarP(&timeout, "timeout", "t", 0, "Set timeout for each trial")
+	pflag.BoolVarP(&tlsHandshake, "tls", "T", false, "Check TLS handshake")
 	pflag.Parse()
-
-	logrus.WithFields(logrus.Fields{
-		"port":         port,
-		"timeout":      timeout,
-		"tlsHandshake": tlsHandshake,
-	}).Info("start")
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, syscall.SIGINT)
@@ -59,13 +61,23 @@ func main() {
 		logrus.WithError(err).Fatal("failed to enable templates")
 	}
 
+	l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		logrus.WithError(err).Fatal("failed to listen")
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"addr":         l.Addr(),
+		"timeout":      timeout,
+		"tlsHandshake": tlsHandshake,
+	}).Info("start")
+
 	s := http.Server{
-		Addr:    fmt.Sprintf(":%d", port),
 		Handler: p,
 	}
 
 	go func() {
-		err := s.ListenAndServe()
+		err := s.Serve(l)
 		switch err {
 		case nil, http.ErrServerClosed:
 		default:
