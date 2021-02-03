@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
@@ -30,17 +31,17 @@ type Proxy struct {
 	// Timeout sets the deadline of trial of each backend HTTP proxy if provided.
 	Timeout time.Duration
 
-	// TLSHandshake requires further check on each backend. If set, a backend which speaks TLS is considered available
-	// if not only it responds a CONNECT request with a successful status code (2XX) but also a TLS handshake succeeds.
-	// This check occurs in a different TCP connection. So there's no guarantee that the proxy connection also succeeds
-	// with a TLS handshake.
-	TLSHandshake *tls.Config
+	// Checks are further checks on each backend. A backend is considered available if not only it responds a CONNECT
+	// request with a successful status code (2XX) but also all the check functions return no errors.
+	Checks []Check
 
 	// Callback is signaled after every trial of the backend HTTP proxies if provided.
 	// The first argument is the CONNECT request, the second argument is the backend HTTP proxy in trial, and the last
 	// argument is the resulting error which is nil if it succeeded.
-	Callback func(*http.Request, string, error)
+	Callback func(connect *http.Request, backend string, err error)
 }
+
+type Check = func(ctx context.Context, connect *http.Request, backend string) error
 
 func (p Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = r.Body.Close()
@@ -192,13 +193,13 @@ func (p *Proxy) connectOne(b string, r *http.Request) (net.Conn, *http.Response,
 		defer cancel()
 	}
 
-	inbound, resp, err := p.inbound(ctx, r, b)
+	inbound, resp, err := inbound(ctx, r, b)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	if p.TLSHandshake != nil {
-		if err := p.checkTLSHandshake(ctx, r, b); err != nil {
+	for _, c := range p.Checks {
+		if err := c(ctx, r, b); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -229,14 +230,21 @@ func pipe(inbound, outbound net.Conn) {
 	wg.Wait()
 }
 
-func (p *Proxy) checkTLSHandshake(ctx context.Context, r *http.Request, b string) error {
-	i, _, err := p.inbound(ctx, r, b)
+// TLS is TLS configuration for Check.
+var TLS tls.Config
+
+// CheckTLSHandshake requires a further check on each backend. If set in Proxy.Checks, a backend which speaks TLS has to
+// succeed TLS handshake.
+// This check occurs in a different TCP connection. So there's no guarantee that the proxy connection also succeeds
+// with a TLS handshake.
+func CheckTLSHandshake(ctx context.Context, connect *http.Request, backend string) error {
+	i, _, err := inbound(ctx, connect, backend)
 	if err != nil {
 		return err
 	}
 
-	target := url.URL{Host: r.RequestURI}
-	config := *p.TLSHandshake
+	target := url.URL{Host: connect.RequestURI}
+	config := TLS
 	config.ServerName = target.Hostname()
 	conn := tls.Client(i, &config)
 	defer func() {
@@ -254,8 +262,66 @@ func (p *Proxy) checkTLSHandshake(ctx context.Context, r *http.Request, b string
 	return nil
 }
 
-func (p *Proxy) inbound(ctx context.Context, r *http.Request, b string) (net.Conn, *http.Response, error) {
-	u, err := urlParse(b)
+// CheckFavicon requires further check on each backend. If set in Proxy.Checks, a backend has to succeed a GET request
+// for favicon.
+func CheckFavicon(ctx context.Context, connect *http.Request, backend string) error {
+	u, err := url.Parse(backend)
+	if err != nil {
+		return err
+	}
+
+	c := http.Client{
+		Transport: &http.Transport{
+			Proxy:           http.ProxyURL(u),
+			TLSClientConfig: &TLS,
+		},
+	}
+
+	target := url.URL{
+		Scheme: "https",
+		Host:   connect.RequestURI,
+	}
+	switch target.Port() {
+	case "80":
+		target.Scheme = "http"
+		target.Host = target.Hostname()
+	case "443":
+		target.Host = target.Hostname()
+	}
+
+	rootURL := target
+	rootURL.Path = "/"
+
+	faviconURL := target
+	faviconURL.Path = "/favicon.ico"
+
+	req, err := http.NewRequest(http.MethodGet, faviconURL.String(), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Sec-Fetch-Mode", "no-cors")
+	req.Header.Set("Sec-Fetch-Dest", "image")
+	req.Header.Set("Referer", rootURL.String())
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	req.Header.Set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+	req.Header.Set("User-Agent", connect.Header.Get("User-Agent"))
+
+	resp, err := c.Do(req.WithContext(ctx))
+	if err != nil {
+		return err
+	}
+	_, _ = io.Copy(ioutil.Discard, resp.Body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("favicon status: %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+func inbound(ctx context.Context, connect *http.Request, backend string) (net.Conn, *http.Response, error) {
+	u, err := urlParse(backend)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -266,13 +332,13 @@ func (p *Proxy) inbound(ctx context.Context, r *http.Request, b string) (net.Con
 		return nil, nil, err
 	}
 
-	req := backendReq(r, u.User)
+	req := backendReq(connect, u.User)
 	if err := req.Write(inbound); err != nil {
 		return nil, nil, err
 	}
 
 	br := bufio.NewReader(inbound)
-	resp, err := http.ReadResponse(br, r)
+	resp, err := http.ReadResponse(br, connect)
 	if err != nil {
 		return nil, nil, err
 	}
