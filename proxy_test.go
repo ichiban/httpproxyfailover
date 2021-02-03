@@ -2,7 +2,6 @@ package httpproxyfailover
 
 import (
 	"bufio"
-	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -304,9 +303,15 @@ func TestProxies_ServeHTTP(t *testing.T) {
 		defer backend.Close()
 
 		t.Run("OK", func(t *testing.T) {
+			tls := TLS
+			TLS = *origin.Client().Transport.(*http.Transport).TLSClientConfig
+			defer func() {
+				TLS = tls
+			}()
+
 			proxy := httptest.NewServer(&Proxy{
-				Backends:     []string{backend.URL},
-				TLSHandshake: origin.Client().Transport.(*http.Transport).TLSClientConfig,
+				Backends: []string{backend.URL},
+				Checks:   []Check{CheckTLSHandshake},
 			})
 			defer proxy.Close()
 
@@ -326,8 +331,8 @@ func TestProxies_ServeHTTP(t *testing.T) {
 
 		t.Run("NG", func(t *testing.T) {
 			proxy := httptest.NewServer(&Proxy{
-				Backends:     []string{backend.URL},
-				TLSHandshake: &tls.Config{},
+				Backends: []string{backend.URL},
+				Checks:   []Check{CheckTLSHandshake},
 			})
 			defer proxy.Close()
 
@@ -338,6 +343,86 @@ func TestProxies_ServeHTTP(t *testing.T) {
 			transport, ok := c.Transport.(*http.Transport)
 			assert.True(t, ok)
 			transport.Proxy = http.ProxyURL(proxyURL)
+
+			_, err = c.Get(origin.URL)
+			assert.Error(t, err)
+		})
+	})
+
+	t.Run("favicon", func(t *testing.T) {
+		backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, http.MethodConnect, r.Method)
+			assert.NoError(t, r.Body.Close())
+
+			inbound, err := net.Dial("tcp", r.URL.Host)
+			assert.NoError(t, err)
+
+			w.Header().Set("Content-Length", "0")
+			w.WriteHeader(http.StatusOK)
+			h, ok := w.(http.Hijacker)
+			assert.True(t, ok)
+
+			outbound, _, err := h.Hijack()
+			assert.NoError(t, err)
+
+			pipe(inbound, outbound)
+		}))
+		defer backend.Close()
+
+		t.Run("OK", func(t *testing.T) {
+			origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, http.MethodGet, r.Method)
+				assert.NoError(t, r.Body.Close())
+				_, err := w.Write([]byte("origin"))
+				assert.NoError(t, err)
+			}))
+			defer origin.Close()
+
+			proxy := httptest.NewServer(&Proxy{
+				Backends: []string{backend.URL},
+				Checks:   []Check{CheckFavicon},
+			})
+			defer proxy.Close()
+
+			proxyURL, err := url.Parse(proxy.URL)
+			assert.NoError(t, err)
+
+			c := origin.Client()
+			c.Transport.(*http.Transport).Proxy = http.ProxyURL(proxyURL)
+
+			tls := TLS
+			TLS = *c.Transport.(*http.Transport).TLSClientConfig
+			defer func() {
+				TLS = tls
+			}()
+
+			resp, err := c.Get(origin.URL)
+			assert.NoError(t, err)
+			assert.NoError(t, resp.Body.Close())
+			assert.Equal(t, http.StatusOK, resp.StatusCode)
+		})
+
+		t.Run("NG", func(t *testing.T) {
+			origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				h, ok := w.(http.Hijacker)
+				assert.True(t, ok)
+				conn, _, err := h.Hijack()
+				assert.NoError(t, err)
+				conn.Close()
+			}))
+			defer origin.Close()
+
+			proxy := httptest.NewServer(&Proxy{
+				Backends: []string{backend.URL},
+				Checks:   []Check{CheckFavicon},
+			})
+			defer proxy.Close()
+
+			proxyURL, err := url.Parse(proxy.URL)
+			assert.NoError(t, err)
+
+			c := origin.Client()
+			c.Transport.(*http.Transport).Proxy = http.ProxyURL(proxyURL)
 
 			_, err = c.Get(origin.URL)
 			assert.Error(t, err)
