@@ -265,7 +265,7 @@ func CheckTLSHandshake(ctx context.Context, connect *http.Request, backend strin
 // CheckFavicon requires further check on each backend. If set in Proxy.Checks, a backend has to succeed a GET request
 // for favicon.
 func CheckFavicon(ctx context.Context, connect *http.Request, backend string) error {
-	u, err := url.Parse(backend)
+	u, err := urlParse(backend)
 	if err != nil {
 		return err
 	}
