@@ -60,6 +60,13 @@ connection always fail because of unsuccessful TLS handshakes.
 
 With `--tls`(`-T`) option, `httpproxyfailover` will skip those proxies with unsuccessful TLS handshakes.
 
+### favicon
+
+Even though you have established a proxy connection, it may not be able to actually access the contents of the origin
+server through it.
+
+With `--favicon`(`-f`) option, `httpproxyfailover` will skip those proxies which can't GET `/favicon.ico`.
+
 ### Tags
 
 By prepending curly-bracketed words in front of the URLs, you can assign tags to the backend proxies.
