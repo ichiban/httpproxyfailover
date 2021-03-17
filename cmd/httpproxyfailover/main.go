@@ -40,7 +40,7 @@ func main() {
 	p := httpproxyfailover.Proxy{
 		Backends: pflag.Args(),
 		Timeout:  timeout,
-		Callback: func(r *http.Request, b string, err error) {
+		OnConnect: func(r *http.Request, b string, err error) {
 			log := logrus.WithFields(logrus.Fields{
 				"from": r.RemoteAddr,
 				"to":   r.RequestURI,
@@ -51,6 +51,12 @@ func main() {
 				return
 			}
 			log.Info("connect")
+		},
+		OnDisconnect: func(read, wrote int64) {
+			logrus.WithFields(logrus.Fields{
+				"read":  read,
+				"wrote": wrote,
+			}).Info("disconnect")
 		},
 	}
 
