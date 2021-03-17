@@ -35,10 +35,16 @@ type Proxy struct {
 	// request with a successful status code (2XX) but also all the check functions return no errors.
 	Checks []Check
 
-	// Callback is signaled after every trial of the backend HTTP proxies if provided.
+	// OnConnect is signaled after every trial of the backend HTTP proxies if provided.
 	// The first argument is the CONNECT request, the second argument is the backend HTTP proxy in trial, and the last
 	// argument is the resulting error which is nil if it succeeded.
-	Callback func(connect *http.Request, backend string, err error)
+	OnConnect func(connect *http.Request, backend string, err error)
+
+	// OnDisconnect is signaled after closing a connection to a backend HTTP proxy. The arguments are the numbers of
+	// bytes which are read from and written to the backend HTTP proxy respectively.
+	// It won't be signaled for a failed trial of a backend HTTP proxies, thus it won't be called right after a call of
+	// OnConnect with non-nil err.
+	OnDisconnect func(read, wrote int64)
 }
 
 type Check = func(ctx context.Context, connect *http.Request, backend string) error
@@ -74,8 +80,11 @@ func (p *Proxy) EnableTemplates() error {
 }
 
 func (p Proxy) connect(w http.ResponseWriter, r *http.Request) {
-	if p.Callback == nil {
-		p.Callback = func(*http.Request, string, error) {}
+	if p.OnConnect == nil {
+		p.OnConnect = func(*http.Request, string, error) {}
+	}
+	if p.OnDisconnect == nil {
+		p.OnDisconnect = func(read, wrote int64) {}
 	}
 
 	backends, err := p.applicableBackends(r)
@@ -86,12 +95,10 @@ func (p Proxy) connect(w http.ResponseWriter, r *http.Request) {
 
 	for _, b := range backends {
 		inbound, resp, err := p.connectOne(b, r)
+		p.OnConnect(r, b, err)
 		if err != nil {
-			p.Callback(r, b, err)
 			continue
 		}
-
-		p.Callback(r, b, nil)
 
 		h, ok := w.(http.Hijacker)
 		if !ok {
@@ -106,7 +113,7 @@ func (p Proxy) connect(w http.ResponseWriter, r *http.Request) {
 		}
 
 		_ = resp.Write(outbound)
-		pipe(inbound, outbound)
+		p.OnDisconnect(pipe(inbound, outbound))
 		return
 	}
 
@@ -207,7 +214,9 @@ func (p *Proxy) connectOne(b string, r *http.Request) (net.Conn, *http.Response,
 	return inbound, resp, nil
 }
 
-func pipe(inbound, outbound net.Conn) {
+func pipe(inbound, outbound net.Conn) (int64, int64) {
+	var read, wrote int64
+
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -216,7 +225,7 @@ func pipe(inbound, outbound net.Conn) {
 			_ = inbound.Close()
 		}()
 
-		_, _ = io.Copy(inbound, outbound)
+		wrote, _ = io.Copy(inbound, outbound)
 	}()
 	wg.Add(1)
 	go func() {
@@ -225,9 +234,11 @@ func pipe(inbound, outbound net.Conn) {
 			_ = outbound.Close()
 		}()
 
-		_, _ = io.Copy(outbound, inbound)
+		read, _ = io.Copy(outbound, inbound)
 	}()
 	wg.Wait()
+
+	return read, wrote
 }
 
 // TLS is TLS configuration for Check.
