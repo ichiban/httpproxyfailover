@@ -331,6 +331,50 @@ func CheckFavicon(ctx context.Context, connect *http.Request, backend string) er
 	return nil
 }
 
+// CheckGET requires further check on each backend. If set in Proxy.Checks, a backend has to succeed a GET request
+// for any of the given URLs.
+func CheckGET(urls ...string) func(ctx context.Context, connect *http.Request, backend string) error {
+	return func(ctx context.Context, connect *http.Request, backend string) error {
+		u, err := urlParse(backend)
+		if err != nil {
+			return err
+		}
+
+		c := http.Client{
+			Transport: &http.Transport{
+				Proxy:           http.ProxyURL(u),
+				TLSClientConfig: &TLS,
+			},
+		}
+
+		errs := make([]error, 0, len(urls))
+		for _, url := range urls {
+			req, err := http.NewRequest(http.MethodGet, url, nil)
+			if err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			req.Header.Set("User-Agent", connect.Header.Get("User-Agent"))
+
+			resp, err := c.Do(req.WithContext(ctx))
+			if err != nil {
+				errs = append(errs, err)
+				continue
+			}
+
+			_, _ = io.Copy(ioutil.Discard, resp.Body)
+			_ = resp.Body.Close()
+
+			if resp.StatusCode/100 == 2 {
+				return nil
+			}
+
+			errs = append(errs, err)
+		}
+		return fmt.Errorf("%v", errs)
+	}
+}
+
 func inbound(ctx context.Context, connect *http.Request, backend string) (net.Conn, *http.Response, error) {
 	u, err := urlParse(backend)
 	if err != nil {

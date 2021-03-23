@@ -444,6 +444,133 @@ func TestProxies_ServeHTTP(t *testing.T) {
 			assert.Error(t, err)
 		})
 	})
+
+	t.Run("GET", func(t *testing.T) {
+		backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, http.MethodConnect, r.Method)
+			assert.NoError(t, r.Body.Close())
+
+			inbound, err := net.Dial("tcp", r.URL.Host)
+			assert.NoError(t, err)
+
+			w.Header().Set("Content-Length", "0")
+			w.WriteHeader(http.StatusOK)
+			h, ok := w.(http.Hijacker)
+			assert.True(t, ok)
+
+			outbound, _, err := h.Hijack()
+			assert.NoError(t, err)
+
+			pipe(inbound, outbound)
+		}))
+		defer backend.Close()
+
+		t.Run("OK", func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/target", func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, http.MethodGet, r.Method)
+				assert.NoError(t, r.Body.Close())
+				_, err := w.Write([]byte("origin"))
+				assert.NoError(t, err)
+			})
+			mux.HandleFunc("/check1", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusNotFound)
+			})
+			mux.HandleFunc("/check2", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			})
+
+			origin := httptest.NewTLSServer(mux)
+			defer origin.Close()
+
+			originURL, err := url.Parse(origin.URL)
+			assert.NoError(t, err)
+
+			target := *originURL
+			target.Path = "/target"
+
+			check1 := *originURL
+			check1.Path = "/check1"
+
+			check2 := *originURL
+			check2.Path = "/check2"
+
+			proxy := httptest.NewServer(&Proxy{
+				Backends: []string{backend.URL},
+				Checks:   []Check{CheckGET(check1.String(), check2.String())},
+			})
+			defer proxy.Close()
+
+			proxyURL, err := url.Parse(proxy.URL)
+			assert.NoError(t, err)
+
+			c := origin.Client()
+			c.Transport.(*http.Transport).Proxy = http.ProxyURL(proxyURL)
+
+			tls := TLS
+			TLS = *c.Transport.(*http.Transport).TLSClientConfig
+			defer func() {
+				TLS = tls
+			}()
+
+			resp, err := c.Get(target.String())
+			assert.NoError(t, err)
+			assert.NoError(t, resp.Body.Close())
+			assert.Equal(t, http.StatusOK, resp.StatusCode)
+		})
+
+		t.Run("NG", func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/target", func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, http.MethodGet, r.Method)
+				assert.NoError(t, r.Body.Close())
+				_, err := w.Write([]byte("origin"))
+				assert.NoError(t, err)
+			})
+			mux.HandleFunc("/check1", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusNotFound)
+			})
+			mux.HandleFunc("/check2", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusNotFound)
+			})
+
+			origin := httptest.NewTLSServer(mux)
+			defer origin.Close()
+
+			originURL, err := url.Parse(origin.URL)
+			assert.NoError(t, err)
+
+			target := *originURL
+			target.Path = "/target"
+
+			check1 := *originURL
+			check1.Path = "/check1"
+
+			check2 := *originURL
+			check2.Path = "/check2"
+
+			proxy := httptest.NewServer(&Proxy{
+				Backends: []string{backend.URL},
+				Checks:   []Check{CheckGET(check1.String(), check2.String())},
+			})
+			defer proxy.Close()
+
+			proxyURL, err := url.Parse(target.String())
+			assert.NoError(t, err)
+
+			c := origin.Client()
+			c.Transport.(*http.Transport).Proxy = http.ProxyURL(proxyURL)
+
+			tls := TLS
+			TLS = *c.Transport.(*http.Transport).TLSClientConfig
+			defer func() {
+				TLS = tls
+			}()
+
+			_, err = c.Get(origin.URL)
+			assert.Error(t, err)
+		})
+	})
 }
 
 func TestProxy_EnableTemplates(t *testing.T) {

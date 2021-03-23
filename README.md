@@ -67,6 +67,15 @@ server through it.
 
 With `--favicon`(`-f`) option, `httpproxyfailover` will skip those proxies which can't GET `/favicon.ico`.
 
+### GET
+
+You may want to check if the proxy is working by requesting a server under your control.
+
+With `--get URL`(`-g`) option, `httpproxyfailover` will skip those proxies which can't GET `URL` successfully.
+
+You can provide as many URLs as you want by repeating the option `--get https://example.com/foo --get https://example.org/bar`.
+Then, `httpproxyfailover` will consider the proxy is working if it GETs at least one of the URLs successfully.
+
 ### Tags
 
 By prepending curly-bracketed words in front of the URLs, you can assign tags to the backend proxies.
