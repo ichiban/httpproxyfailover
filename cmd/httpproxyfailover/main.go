@@ -27,11 +27,13 @@ func main() {
 	var timeout time.Duration
 	var tlsHandshake bool
 	var favicon bool
+	var get []string
 
 	pflag.IntVarP(&port, "port", "p", 0, "Specify port number to listen on (random if not specified)")
 	pflag.DurationVarP(&timeout, "timeout", "t", 0, "Set timeout for each trial")
 	pflag.BoolVarP(&tlsHandshake, "tls", "T", false, "Check TLS handshake")
 	pflag.BoolVarP(&favicon, "favicon", "f", false, "Check Favicon")
+	pflag.StringSliceVarP(&get, "get", "g", nil, "Check GET")
 	pflag.Parse()
 
 	c := make(chan os.Signal, 1)
@@ -66,6 +68,10 @@ func main() {
 
 	if favicon {
 		p.Checks = append(p.Checks, httpproxyfailover.CheckFavicon)
+	}
+
+	if len(get) > 0 {
+		p.Checks = append(p.Checks, httpproxyfailover.CheckGET(get...))
 	}
 
 	if err := p.EnableTemplates(); err != nil {
