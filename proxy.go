@@ -59,7 +59,7 @@ func (p Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// EnableTemplates() parses backends as URI templates.
+// EnableTemplates parses backends as URI templates.
 // Proxy will connect to only applicable backends which template variables are satisfied.
 // The values for template variables are populated from the credentials in Proxy-Authorization header. The substring
 // before the first ':' (usually considered as username) should be the form of a list of key-value pairs (`k1=v1,k2=v2`).
