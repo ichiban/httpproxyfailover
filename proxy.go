@@ -255,9 +255,9 @@ func CheckTLSHandshake(ctx context.Context, connect *http.Request, backend strin
 	}
 
 	target := url.URL{Host: connect.RequestURI}
-	config := TLS
+	config := TLS.Clone()
 	config.ServerName = target.Hostname()
-	conn := tls.Client(i, &config)
+	conn := tls.Client(i, config)
 	defer func() {
 		_ = conn.Close()
 	}()
